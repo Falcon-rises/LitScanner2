@@ -1,4 +1,7 @@
 fastapi
+flask
+streamlit
+requests
 uvicorn[standard]
 redis
 httpx
