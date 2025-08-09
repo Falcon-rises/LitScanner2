@@ -1,0 +1,7 @@
+redis
+httpx
+python-dotenv
+sentence-transformers
+numpy
+scikit-learn
+requests
