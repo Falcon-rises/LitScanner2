@@ -5,5 +5,11 @@
   ],
   "routes": [
     { "src": "/(.*)", "dest": "index.py" }
-  ]
+  ], 
+
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.9",
+      "excludeFiles": "big_models/**"
+      ]
 }
