@@ -15,9 +15,6 @@ def launch_streamlit():
         env=os.environ.copy()
     )
 
-@app.route("/")
-def home():
-    return "Streamlit app is running — visit / for your interface."
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+if __name__ != "__main__":
+    # For Vercel
+    handler = app
