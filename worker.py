@@ -1,75 +1,68 @@
 # worker.py
+# Listens to Redis queue and runs tasks_impl.run_pipeline
 import os
 import time
-import json
 import redis
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Redis configuration
+# Get Redis URL from environment or fallback
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-JOB_QUEUE = os.getenv("JOB_QUEUE", "lithybrid:queue")
-JOB_META_PREFIX = os.getenv("JOB_META_PREFIX", "lithybrid:job:")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-# Connect to Redis
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    print(f"[Worker] Connected to Redis at {REDIS_URL}")
-except Exception as e:
-    print(f"[Worker] Failed to connect to Redis: {e}")
-    raise
+# Queue and job key prefixes
+JOB_QUEUE = "lithybrid:queue"
+JOB_META_PREFIX = "lithybrid:job:"
 
-# Import the pipeline function
+# Import worker pipeline function
 try:
     from tasks_impl import run_pipeline
-except ImportError:
-    print("[Worker] tasks_impl.py not found — cannot import run_pipeline()")
-    raise
+except ImportError as e:
+    print(f"ERROR: Cannot import run_pipeline: {e}")
+    exit(1)
 
-print("[Worker] Listening for jobs on queue:", JOB_QUEUE)
+print("✅ Worker started. Listening for jobs...")
 
-def process_job(project_id, meta):
-    """Process a single job from the queue."""
+while True:
     try:
+        res = redis_client.blpop(JOB_QUEUE, timeout=10)  # Wait up to 10s for a job
+        if not res:
+            continue
+
+        _, project_id = res
+        print(f"📦 Picked job: {project_id}")
+
+        meta = redis_client.hgetall(JOB_META_PREFIX + project_id)
+        if not meta:
+            print(f"⚠️ No metadata found for job {project_id}")
+            continue
+
+        # Update status to "processing"
         redis_client.hset(JOB_META_PREFIX + project_id, mapping={
             "status": "processing",
             "progress": "2"
         })
 
-        summary = run_pipeline(project_id, meta)
-        redis_client.hset(JOB_META_PREFIX + project_id, mapping={
-            "status": "completed",
-            "progress": "100",
-            "result": json.dumps(summary)
-        })
-        print(f"[Worker] Job {project_id} completed successfully")
-    except Exception as ex:
-        redis_client.hset(JOB_META_PREFIX + project_id, mapping={
-            "status": "error",
-            "progress": "0",
-            "error": str(ex)
-        })
-        print(f"[Worker] Error processing job {project_id}: {ex}")
+        try:
+            summary = run_pipeline(project_id, meta)
+            num_papers = summary.get("num_papers", "unknown")
+            print(f"✅ Pipeline finished for {project_id} -> {num_papers} papers")
+            redis_client.hset(JOB_META_PREFIX + project_id, mapping={
+                "status": "completed",
+                "progress": "100",
+                "num_papers": num_papers
+            })
 
-while True:
-    try:
-        res = redis_client.blpop(JOB_QUEUE, timeout=10)
-        if not res:
-            continue
-
-        _, project_id = res
-        print(f"[Worker] Picked job: {project_id}")
-
-        meta = redis_client.hgetall(JOB_META_PREFIX + project_id)
-        if not meta:
-            print(f"[Worker] No metadata found for job {project_id}")
-            continue
-
-        process_job(project_id, meta)
+        except Exception as ex:
+            print(f"❌ Pipeline error for {project_id}: {ex}")
+            redis_client.hset(JOB_META_PREFIX + project_id, mapping={
+                "status": "error",
+                "progress": "0",
+                "error": str(ex)
+            })
 
     except Exception as e:
-        print(f"[Worker] Main loop error: {e}")
-        time.sleep(2)
-
+        print(f"🔥 Worker main loop error: {e}")
+        time.sleep(2)  # Small delay before retrying
