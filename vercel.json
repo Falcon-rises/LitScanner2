@@ -1,15 +1,10 @@
 {
   "version": 2,
   "builds": [
-    { "src": "index.py", "use": "@vercel/python" }
+    { "src": "api/*.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "index.py" }
-  ],
-  "functions": {
-    "index.py": {
-      "runtime": "python3.9",
-      "excludeFiles": "big_models/**"
-    }
-  }
+    { "src": "/api/(.*)", "dest": "/api/index.py" },
+    { "src": "/", "dest": "/api/index.py" }
+  ]
 }
