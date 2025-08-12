@@ -1,4 +1,3 @@
-# api/run_job.py
 import os
 import json
 import redis
