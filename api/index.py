@@ -1,144 +1,90 @@
 # api/index.py
 import os
 import json
-import uuid
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-
-# Lazy import Redis to avoid Vercel cold-start crashes if REDIS_URL missing
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 import redis
+import traceback
 
-# Environment variables
-REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    raise RuntimeError("REDIS_URL must be set in environment variables")
+app = FastAPI()
 
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-except Exception as e:
-    raise RuntimeError(f"Failed to connect to Redis: {e}")
+def get_redis():
+    """Connect to Redis using env variable or raise a clear error."""
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        raise RuntimeError("REDIS_URL environment variable is missing.")
+    try:
+        return redis.from_url(redis_url)
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to Redis: {e}")
 
-JOB_PREFIX = os.getenv("JOB_PREFIX", "lithybrid:job:")
-
-app = FastAPI(title="LitHybrid API (chunked-worker)")
-
-
-# -------- Models -------- #
-class ProjectRequest(BaseModel):
-    title: str
-    max_papers: Optional[int] = 7000
-    per_run: Optional[int] = 100
-    expected_time_minutes: Optional[int] = 30
-
-
-# -------- Routes -------- #
-@app.get("/")
-def root():
-    return {"ok": True, "service": "LitHybrid API (chunked-worker)"}
-
-
-@app.post("/api/projects")
-def create_project(req: ProjectRequest):
-    project_id = str(uuid.uuid4())
-    meta = {
-        "project_id": project_id,
-        "title": req.title,
-        "max_papers": str(req.max_papers),
-        "per_run": str(req.per_run),
-        "status": "queued",
-        "progress": "0",
-        "next_offset": "0",
-        "expected_time_minutes": str(req.expected_time_minutes or 30)
-    }
-    redis_client.hset(JOB_PREFIX + project_id, mapping=meta)
-    redis_client.set(JOB_PREFIX + project_id + ":papers", json.dumps([]))
-    return {
-        "project_id": project_id,
-        "status": "queued",
-        "expected_time_minutes": meta["expected_time_minutes"]
-    }
-
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    """Check the status of a given job."""
+    try:
+        r = get_redis()
+        status = r.get(f"job:{job_id}:status")
+        if status is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"job_id": job_id, "status": status.decode("utf-8")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "trace": traceback.format_exc()}
+        )
 
 @app.post("/api/run_job")
-def run_job(project_id: str = Query(...)):
-    meta = redis_client.hgetall(JOB_PREFIX + project_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="No metadata found")
-
-    redis_client.hset(JOB_PREFIX + project_id, mapping={
-        "status": "processing",
-        "progress": "2"
-    })
-
+async def run_job(request: Request):
+    """
+    Trigger a job without blocking the request.
+    Vercel functions must return in <10s, so heavy work should be done elsewhere.
+    """
     try:
-        # Heavy import inside function
-        from tasks_impl import run_pipeline
-        summary = run_pipeline(project_id, meta)
+        data = await request.json()
+        job_id = data.get("job_id")
+        if not job_id:
+            raise HTTPException(status_code=400, detail="Missing job_id")
 
-        redis_client.hset(JOB_PREFIX + project_id, mapping={
-            "status": "done",
-            "progress": "100",
-            "summary": json.dumps(summary)
-        })
+        # Import heavy modules here (lazy import)
+        import tasks_impl
 
-        return {"success": True, "summary": summary}
+        # Mark job as started
+        r = get_redis()
+        r.set(f"job:{job_id}:status", "started")
+
+        # Run the pipeline (⚠️ will still block if it takes >10s)
+        # For production: push this to a worker queue instead
+        result = tasks_impl.run_pipeline(data)
+
+        # Store result in Redis
+        r.set(f"job:{job_id}:status", "completed")
+        r.set(f"job:{job_id}:result", json.dumps(result, default=str))
+
+        return {"job_id": job_id, "status": "completed", "result": result}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        redis_client.hset(JOB_PREFIX + project_id, mapping={
-            "status": "error",
-            "progress": "0",
-            "error": str(e)
-        })
-        # Log for Vercel dashboard
-        print(f"[ERROR] run_job failed for {project_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "trace": traceback.format_exc()}
+        )
 
-
-@app.get("/api/projects/{project_id}/status")
-def project_status(project_id: str):
-    key = JOB_PREFIX + project_id
-    if not redis_client.exists(key):
-        raise HTTPException(status_code=404, detail="project not found")
-    data = redis_client.hgetall(key)
-    for k in ("max_papers", "per_run", "next_offset"):
-        if k in data:
-            try:
-                data[k] = int(data[k])
-            except Exception:
-                pass
-    return data
-
-
-@app.get("/api/projects/{project_id}/papers")
-def project_papers(project_id: str, page: int = 1, per_page: int = 1000):
-    papers_key = JOB_PREFIX + project_id + ":papers"
-    if not redis_client.exists(papers_key):
-        raise HTTPException(status_code=404, detail="papers not available")
-    raw = redis_client.get(papers_key) or "[]"
+@app.get("/api/result/{job_id}")
+async def get_result(job_id: str):
+    """Retrieve the result of a completed job."""
     try:
-        papers = json.loads(raw)
-    except Exception:
-        papers = []
-    start = (page - 1) * per_page
-    end = start + per_page
-    return {
-        "project_id": project_id,
-        "page": page,
-        "per_page": per_page,
-        "total": len(papers),
-        "papers": papers[start:end]
-    }
-
-
-@app.get("/api/projects/{project_id}/summary")
-def project_summary(project_id: str):
-    key = JOB_PREFIX + project_id
-    if not redis_client.exists(key):
-        raise HTTPException(status_code=404, detail="project not found")
-    summary_raw = redis_client.hget(key, "summary")
-    if not summary_raw:
-        raise HTTPException(status_code=404, detail="summary not ready")
-    try:
-        return {"project_id": project_id, "summary": json.loads(summary_raw)}
-    except Exception:
-        return {"project_id": project_id, "summary": summary_raw}
+        r = get_redis()
+        result = r.get(f"job:{job_id}:result")
+        if result is None:
+            raise HTTPException(status_code=404, detail="Result not found")
+        return json.loads(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "trace": traceback.format_exc()}
+        )
