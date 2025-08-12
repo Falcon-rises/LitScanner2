@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import redis
+from fastapi import Query
 
 REDIS_URL = os.getenv("REDIS_URL")
 if not REDIS_URL:
@@ -13,6 +14,36 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 JOB_PREFIX = os.getenv("JOB_PREFIX", "lithybrid:job:")
 app = FastAPI(title="LitHybrid API (chunked-worker)")
+
+
+@app.post("/api/run_job")
+def run_job(project_id: str = Query(...)):
+    meta = redis_client.hgetall(JOB_PREFIX + project_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="No metadata found")
+
+    redis_client.hset(JOB_PREFIX + project_id, mapping={
+        "status": "processing", "progress": "2"
+    })
+
+    try:
+        # Import here to avoid slow startup
+        from tasks_impl import run_pipeline
+        summary = run_pipeline(project_id, meta)
+
+        redis_client.hset(JOB_PREFIX + project_id, mapping={
+            "status": "done",
+            "progress": "100",
+            "summary": json.dumps(summary)
+        })
+
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        redis_client.hset(JOB_PREFIX + project_id, mapping={
+            "status": "error", "progress": "0", "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 class ProjectRequest(BaseModel):
     title: str
